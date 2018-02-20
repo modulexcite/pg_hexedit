@@ -1,0 +1,110 @@
+#!/bin/bash
+usage() {
+  cat <<EOM
+  Usage:
+  $(basename $0) segmentname relname
+
+EOM
+  exit 0
+}
+
+[ -z $2 ] && { usage; }
+
+source ./hexedit.cfg
+
+segmentname=$1
+relname=$2
+
+version_dir="$2_`basename $1`"
+mkdir "$version_dir"
+cd "$version_dir"
+
+pg_waldump $1 > pg_waldump_output.txt
+
+# Create per-relfile-fork-block directories
+for i in *; do
+  dir=$(echo "$i" | sed -e '/fpi/s/_[0-9]\+_[0-9]\+\-[0-9A-F]\+\.fpi$//');
+  #echo "i is $i"
+  #echo "dir is $dir"
+  if [[ "$i" != "directory" ]]; then
+    mkdir -p "${dir%% *}"
+    mv "$i" "${dir%% *}/$i"
+  fi
+done
+
+# Run pg_hexedit on all main forks
+for i in *; do
+  dir=$(echo "$i" | sed -e '/fpi/s/_[0-9]\+_[0-9]\+\-[0-9A-F]\+\.fpi$//');
+
+  if [[ $dir =~ .*_main.* ]]
+  then
+    echo "dir with main is $dir"
+    cd "$dir"
+    for j in *; do
+      if [[ $j =~ .*fpi ]]
+      then
+        #echo "going to run pg_hexedit on $j"
+        ../../pg_hexedit -n 1 $j > $j.tags
+      fi
+    done
+    cd ..
+  fi
+done
+
+if [ ! $? -eq 0 ]; then
+  echo "pg_waldump failed"
+  exit
+fi
+
+# Spoof home director, to avoid clobbering real /.wxHexEditor file
+export HOME=`pwd`
+wxconfig="$HOME/.wxHexEditor"
+
+psql --no-psqlrc -c "CHECKPOINT"
+if [ ! $? -eq 0 ]; then
+  echo "CHECKPOINT failed"
+  exit
+fi
+
+RFN=$(psql --no-psqlrc -tA -c "SELECT pg_relation_filepath('$relname')")
+if [ ! $? -eq 0 ]; then
+  echo "invoking pg_relation_filepath() failed"
+  exit
+fi
+
+# Put minimal .wxHexEditor registry style config file in place, so old tags are
+# forgotten.  This is also where we generate convenience "Go to offset" dialog
+# offsets in the registry/cache.
+
+echo "Replacing $wxconfig with pg_hexedit optimized settings..."
+cat > $wxconfig <<- EOM
+UpdateCheck=0
+UseCustomHexFormat=0
+CustomHexFormat=xx
+UseBytesPerLineLimit=1
+BytesPerLineLimit=$BYTES_PER_LINE_LIMIT
+FontSize=$FONTSIZE
+CharacterEncodingFamily=DOS
+CharacterEncoding=OEM - IBM PC/DOS CP437 - MS-DOS Latin US
+ScreenFullScreen=1
+AutoShowTagPanel=0
+GoToOptions=7
+EOM
+
+PGDATA=$(psql --no-psqlrc -tA -c "SELECT setting FROM pg_settings WHERE name = 'data_directory'")
+echo "Determined that data directory is $PGDATA"
+FULLPATH="$PGDATA/$RFN"
+echo "Running pg_hexedit against $FULLPATH, the first segment in relation $relname..."
+echo "Note: Only blocks $MIN_BLOCK_TAGS - $MAX_BLOCK_TAGS will be annotated, to keep overhead low"
+./pg_hexedit -z -R $MIN_BLOCK_TAGS $MAX_BLOCK_TAGS $FULLPATH > $FULLPATH.tags
+
+if [ ! $? -eq 0 ]; then
+  echo "Error encountered by pg_hexedit. Could not generate all tags."
+  echo "You may still wish to run: $HEXEDITOR $FULLPATH"
+  exit
+fi
+
+echo "Opening $FULLPATH with $HEXEDITOR..."
+echo "Tip: 'Go to Offset' dialog (shortcut: Ctrl + G) has decile splitter block start positions cached"
+# Output from wxHexEditor is verbose, and not terribly useful, so we redirect:
+$HEXEDITOR $FULLPATH &> /dev/null
